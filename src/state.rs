@@ -3,7 +3,6 @@ use std::sync::mpsc::Sender as StdSender;
 use std::thread;
 
 use parking_lot::{Mutex, RwLock};
-use sendspin::protocol::messages::PlayerSyncState;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::config::default_client_name;
@@ -21,13 +20,6 @@ impl SyncState {
             Self::Error
         } else {
             Self::Synchronized
-        }
-    }
-
-    pub(crate) fn as_protocol(self) -> PlayerSyncState {
-        match self {
-            Self::Synchronized => PlayerSyncState::Synchronized,
-            Self::Error => PlayerSyncState::Error,
         }
     }
 }

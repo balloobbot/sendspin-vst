@@ -1,15 +1,15 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rtrb::Producer;
-use sendspin::protocol::client::{AudioChunk, WsSender};
+use sendspin::protocol::client::{AudioChunk, Connection, WsSender};
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientCommand, ClientGoodbye, ClientHello, ClientState, ControllerCommand,
-    DeviceInfo, GoodbyeReason, Message, PlayerFormatRequest, PlayerState, PlayerV1Support,
-    StreamRequestFormat,
+    AudioFormatSpec, ClientCommand, ClientState, ClientSyncState, ControllerCommand,
+    ControllerCommandType, GoodbyeReason, Message, PlayerCommandType, PlayerFormatRequest,
+    PlayerState, PlayerV1Support, StreamRequestFormat,
 };
-use sendspin::ProtocolClient;
+use sendspin::{DefaultClock, ProtocolClientBuilder};
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
 
@@ -29,6 +29,7 @@ pub(crate) fn network_thread_main(
     server_url: String,
     client_name: String,
     client_id: String,
+    clock: Arc<DefaultClock>,
 ) {
     let runtime = TokioRuntimeBuilder::new_current_thread()
         .enable_all()
@@ -105,12 +106,18 @@ pub(crate) fn network_thread_main(
 
             let host_sample_rate_hz = shared.host_sample_rate_hz.load(Ordering::Relaxed).max(44_100);
             let player_support = build_player_support(host_sample_rate_hz);
-            let hello = build_client_hello(&client_id, &active_client_name, player_support);
+            let client_builder = build_client(
+                &client_id,
+                &active_client_name,
+                player_support,
+                player_state(&shared),
+                Arc::clone(&clock),
+            );
 
             let Some(connect_url) = active_server_url.as_ref() else {
                 continue;
             };
-            let client = match ProtocolClient::connect(connect_url, hello).await {
+            let client = match client_builder.connect(connect_url).await {
                 Ok(client) => client,
                 Err(_) => {
                     shared.set_connection_state(ConnectionState::Error);
@@ -145,33 +152,40 @@ pub(crate) fn network_thread_main(
             shared.set_connection_state(ConnectionState::Connected);
             shared.mark_state_dirty();
 
-            let (mut message_rx, mut audio_rx, clock_sync, ws_tx, _guard) = client.split();
+            let Connection {
+                messages: mut message_rx,
+                audio: mut audio_rx,
+                clock_sync,
+                sender: ws_tx,
+                guard,
+                ..
+            } = client.split();
 
             let mut active_stream: Option<ActiveStream> = None;
             let mut state_tick = tokio::time::interval(Duration::from_millis(200));
             let mut last_requested_sample_rate = shared.host_sample_rate_hz.load(Ordering::Relaxed);
 
-            let _ = send_client_state(&ws_tx, &shared).await;
             if let Some(command) = pending_controller_command.take() {
                 let _ = send_controller_command(&ws_tx, &command).await;
             }
 
             let mut reconnect = true;
             let mut reconnect_immediately = false;
+            let mut goodbye_reason = None;
 
             loop {
                 tokio::select! {
                     maybe_cmd = command_rx.recv() => {
                         match maybe_cmd {
                             Some(WorkerCommand::Shutdown) => {
-                                let _ = send_goodbye(&ws_tx, GoodbyeReason::Restart).await;
+                                goodbye_reason = Some(GoodbyeReason::Restart);
                                 reconnect = false;
                                 break;
                             }
                             Some(WorkerCommand::SetServerUrl(new_url)) => {
                                 if let Some(normalized) = normalize_server_url(&new_url) {
                                     if active_server_url.as_ref() != Some(&normalized) {
-                                        let _ = send_goodbye(&ws_tx, GoodbyeReason::Restart).await;
+                                        goodbye_reason = Some(GoodbyeReason::Restart);
                                         active_server_url = Some(normalized.clone());
                                         shared.set_configured_server_url(normalized);
                                         reconnect_immediately = true;
@@ -182,7 +196,7 @@ pub(crate) fn network_thread_main(
                             Some(WorkerCommand::SetClientName(new_client_name)) => {
                                 if let Some(normalized) = normalize_client_name(&new_client_name) {
                                     if normalized != active_client_name {
-                                        let _ = send_goodbye(&ws_tx, GoodbyeReason::Restart).await;
+                                        goodbye_reason = Some(GoodbyeReason::Restart);
                                         active_client_name = normalized.clone();
                                         shared.set_configured_client_name(normalized);
                                         reconnect_immediately = true;
@@ -236,6 +250,13 @@ pub(crate) fn network_thread_main(
                 }
             }
 
+            match goodbye_reason {
+                Some(reason) => {
+                    let _ = guard.disconnect(reason).await;
+                }
+                None => drop(guard),
+            }
+
             shared.set_connection_state(ConnectionState::Disconnected);
             shared.set_group_playback_state(GroupPlaybackState::Unknown);
             shared.set_now_playing(None, None);
@@ -275,28 +296,32 @@ pub(crate) fn network_thread_main(
     });
 }
 
-fn build_client_hello(
+fn build_client(
     client_id: &str,
     client_name: &str,
     player_support: PlayerV1Support,
-) -> ClientHello {
-    ClientHello {
-        client_id: client_id.to_string(),
-        name: client_name.to_string(),
-        version: 1,
-        supported_roles: vec![
-            "player@v1".to_string(),
-            "controller@v1".to_string(),
-            "metadata@v1".to_string(),
-        ],
-        device_info: Some(DeviceInfo {
-            product_name: Some(PRODUCT_NAME.to_string()),
-            manufacturer: Some("Sendspin".to_string()),
-            software_version: Some(EFFECTIVE_PLUGIN_VERSION.to_string()),
-        }),
-        player_v1_support: Some(player_support),
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
+    initial_player_state: PlayerState,
+    clock: Arc<DefaultClock>,
+) -> ProtocolClientBuilder {
+    ProtocolClientBuilder::builder()
+        .client_id(client_id.to_string())
+        .name(client_name.to_string())
+        .product_name(Some(PRODUCT_NAME.to_string()))
+        .manufacturer(Some("Sendspin".to_string()))
+        .software_version(Some(EFFECTIVE_PLUGIN_VERSION.to_string()))
+        .player_v1_support(player_support)
+        .initial_player_state(initial_player_state)
+        .metadata()
+        .controller()
+        .build()
+        .clock(clock)
+}
+
+fn player_state(shared: &SharedState) -> PlayerState {
+    PlayerState {
+        volume: Some(shared.remote_volume.load(Ordering::Relaxed).min(100)),
+        muted: Some(shared.remote_muted.load(Ordering::Relaxed)),
+        ..PlayerState::default()
     }
 }
 
@@ -372,8 +397,8 @@ async fn handle_message(
         }
         Message::ServerCommand(server_command) => {
             if let Some(player_command) = server_command.player {
-                match player_command.command.as_str() {
-                    "volume" => {
+                match player_command.command {
+                    PlayerCommandType::Volume => {
                         if let Some(volume) = player_command.volume {
                             shared
                                 .remote_volume
@@ -381,7 +406,7 @@ async fn handle_message(
                             shared.mark_state_dirty();
                         }
                     }
-                    "mute" => {
+                    PlayerCommandType::Mute => {
                         if let Some(muted) = player_command.mute {
                             shared.remote_muted.store(muted, Ordering::Relaxed);
                             shared.mark_state_dirty();
@@ -404,10 +429,12 @@ fn decode_audio_chunk(
         return None;
     }
 
-    let local_play_time_us = clock_sync
-        .lock()
-        .server_to_client_micros(chunk.timestamp)
-        .unwrap_or_else(|| unix_time_micros().saturating_add(150_000));
+    let local_play_time_us = {
+        let clock_sync = clock_sync.lock();
+        clock_sync
+            .server_to_client_micros(chunk.timestamp)
+            .unwrap_or_else(|| clock_sync.clock().now_micros().saturating_add(150_000))
+    };
 
     let channels = usize::from(stream.channels);
     let decoded = decode_pcm_samples(chunk.data.as_ref(), channels, stream.bit_depth)?;
@@ -510,6 +537,7 @@ async fn request_pcm_format(
             bit_depth: Some(PREFERRED_PCM_BIT_DEPTH),
         }),
         artwork: None,
+        visualizer: None,
     });
 
     ws_tx.send_message(request).await
@@ -520,11 +548,8 @@ async fn send_client_state(
     shared: &SharedState,
 ) -> Result<(), sendspin::error::Error> {
     let message = Message::ClientState(ClientState {
-        player: Some(PlayerState {
-            state: shared.sync_state().as_protocol(),
-            volume: Some(shared.remote_volume.load(Ordering::Relaxed).min(100)),
-            muted: Some(shared.remote_muted.load(Ordering::Relaxed)),
-        }),
+        state: Some(ClientSyncState::Synchronized),
+        player: Some(player_state(shared)),
     });
 
     ws_tx.send_message(message).await
@@ -534,24 +559,26 @@ async fn send_controller_command(
     ws_tx: &WsSender,
     command: &str,
 ) -> Result<(), sendspin::error::Error> {
+    let command = match command {
+        "play" => ControllerCommandType::Play,
+        "pause" => ControllerCommandType::Pause,
+        other => {
+            return Err(sendspin::error::Error::Protocol(format!(
+                "unsupported controller command: {other}"
+            )))
+        }
+    };
     let message = Message::ClientCommand(ClientCommand {
         controller: Some(ControllerCommand {
-            command: command.to_string(),
+            command,
             volume: None,
             mute: None,
+            position_ms: None,
+            offset_ms: None,
         }),
     });
 
     ws_tx.send_message(message).await
-}
-
-async fn send_goodbye(
-    ws_tx: &WsSender,
-    reason: GoodbyeReason,
-) -> Result<(), sendspin::error::Error> {
-    ws_tx
-        .send_message(Message::ClientGoodbye(ClientGoodbye { reason }))
-        .await
 }
 
 enum ReconnectAction {
@@ -591,14 +618,6 @@ async fn wait_reconnect_or_command(
     }
 }
 
-fn unix_time_micros() -> i64 {
-    let Ok(duration_since_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return 0;
-    };
-
-    duration_since_epoch.as_micros() as i64
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -611,10 +630,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        build_client_hello, build_player_support, decode_pcm_samples, network_thread_main,
-        ProtocolClient,
+        build_client, build_player_support, decode_pcm_samples, network_thread_main, DefaultClock,
     };
     use crate::state::{ConnectionState, SharedState, TimestampedChunk, WorkerCommand};
+    use sendspin::protocol::messages::PlayerState;
 
     #[test]
     fn decode_pcm_16() {
@@ -655,6 +674,7 @@ mod tests {
                 server_url,
                 "Sendspin VST Smoke".to_string(),
                 client_id,
+                Arc::new(DefaultClock::new()),
             );
         });
 
@@ -690,10 +710,12 @@ mod tests {
             .unwrap_or_else(|_| "ws://127.0.0.1:8927/sendspin".to_string());
         let client_id = Uuid::new_v4().to_string();
 
-        let hello = build_client_hello(
+        let client = build_client(
             &client_id,
             "Sendspin VST Handshake Test",
             build_player_support(48_000),
+            PlayerState::default(),
+            Arc::new(DefaultClock::new()),
         );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -701,9 +723,9 @@ mod tests {
             .build()
             .expect("failed to build runtime");
 
-        let result = runtime.block_on(async { ProtocolClient::connect(&server_url, hello).await });
+        let result = runtime.block_on(async { client.connect(&server_url).await });
         if let Err(err) = result {
-            panic!("ProtocolClient::connect failed: {err}");
+            panic!("ProtocolClientBuilder::connect failed: {err}");
         }
     }
 }

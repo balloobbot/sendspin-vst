@@ -3,12 +3,13 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
 use parking_lot::Mutex;
 use rtrb::{Consumer, Producer, RingBuffer};
+use sendspin::{Clock, DefaultClock};
 use tokio::sync::mpsc::unbounded_channel;
 
 mod config;
@@ -37,31 +38,6 @@ struct ActiveChunk {
     chunk: TimestampedChunk,
     next_frame_index: usize,
     started: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TimeAnchor {
-    instant: Instant,
-    unix_micros: i64,
-}
-
-impl TimeAnchor {
-    fn capture_now() -> Self {
-        Self {
-            instant: Instant::now(),
-            unix_micros: unix_time_micros(),
-        }
-    }
-
-    fn instant_to_unix_micros(self, instant: Instant) -> i64 {
-        if instant >= self.instant {
-            let delta = instant.duration_since(self.instant).as_micros() as i64;
-            self.unix_micros.saturating_add(delta)
-        } else {
-            let delta = self.instant.duration_since(instant).as_micros() as i64;
-            self.unix_micros.saturating_sub(delta)
-        }
-    }
 }
 
 #[derive(Params)]
@@ -117,7 +93,7 @@ pub struct SendspinVst3 {
     mdns_worker: Option<MdnsWorker>,
     sample_rate_hz: u32,
     render_cursor_us: Option<i64>,
-    time_anchor: TimeAnchor,
+    clock: Arc<DefaultClock>,
     underrun_streak_blocks: u32,
     recovery_streak_blocks: u32,
 }
@@ -136,7 +112,7 @@ impl Default for SendspinVst3 {
             mdns_worker: None,
             sample_rate_hz: 48_000,
             render_cursor_us: None,
-            time_anchor: TimeAnchor::capture_now(),
+            clock: Arc::new(DefaultClock::new()),
             underrun_streak_blocks: 0,
             recovery_streak_blocks: 0,
         }
@@ -184,6 +160,7 @@ impl SendspinVst3 {
         let server_url = self.shared.configured_server_url();
         let client_name = self.shared.configured_client_name();
         let client_id = load_or_create_client_id();
+        let clock = Arc::clone(&self.clock);
         let (command_tx, command_rx) = unbounded_channel();
         self.shared.set_worker_command_tx(command_tx.clone());
 
@@ -195,6 +172,7 @@ impl SendspinVst3 {
                 server_url,
                 client_name,
                 client_id,
+                clock,
             );
         });
 
@@ -664,7 +642,6 @@ impl Plugin for SendspinVst3 {
             .host_block_size
             .store(buffer_config.max_buffer_size, Ordering::Relaxed);
         self.render_cursor_us = None;
-        self.time_anchor = TimeAnchor::capture_now();
         let saved_client_name = self.params.client_name.lock().clone();
         let configured_client_name =
             normalize_client_name(&saved_client_name).unwrap_or_else(default_client_name);
@@ -710,9 +687,7 @@ impl Plugin for SendspinVst3 {
             callback_instant,
             block_latency_us.saturating_add(user_offset_us),
         );
-        let block_start_from_wall = self
-            .time_anchor
-            .instant_to_unix_micros(callback_with_offset);
+        let block_start_from_wall = self.clock.instant_to_micros(callback_with_offset);
         let block_duration_us =
             ((buffer.samples() as i64) * 1_000_000) / i64::from(host_sample_rate_hz);
         let had_render_cursor = self.render_cursor_us.is_some();
@@ -789,14 +764,6 @@ fn shift_instant_by_micros(base: Instant, delta_us: i64) -> Instant {
         base.checked_sub(Duration::from_micros((-delta_us) as u64))
             .unwrap_or(base)
     }
-}
-
-fn unix_time_micros() -> i64 {
-    let Ok(duration_since_epoch) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return 0;
-    };
-
-    duration_since_epoch.as_micros() as i64
 }
 
 #[cfg(test)]
